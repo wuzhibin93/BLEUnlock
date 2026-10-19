@@ -326,6 +326,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
             print("delayed system wake job")
             NSApp.setActivationPolicy(.accessory) // Hide Dock icon again
             self.systemSleep = false
+            self.ble.resumeScan()
             self.tryUnlockScreen()
         })
     }
@@ -333,6 +334,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     @objc func onSystemSleep() {
         print("system sleep")
         systemSleep = true
+        ble.suspendScan()
         // Set activation policy to regular, so the CBCentralManager can scan for peripherals
         // when the Bluetooth will become on again.
         // This enables Dock icon but the screen is off anyway.

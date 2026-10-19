@@ -139,16 +139,60 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var latestN: Int = 5
     var activeModeTimer : Timer? = nil
     var connectionTimer : Timer? = nil
+    // CoreBluetooth can silently stop delivering advertisements while it still
+    // reports isScanning == true, typically after sleep/wake or a long scan.
+    // Keep track of the last callback and periodically restart the scan.
+    var lastDiscoverAt = Date().timeIntervalSince1970
+    var scanWatchdogTimer: Timer? = nil
+    let scanStaleTimeout = 60.0
 
-    func scanForPeripherals() {
-        guard !centralMgr.isScanning else { return }
+    func scanForPeripherals(force: Bool = false) {
+        guard centralMgr.state == .poweredOn else { return }
+        if force {
+            // stopScan() followed by scanForPeripherals() is the only reliable
+            // way to recover from a stuck/expired scan.
+            centralMgr.stopScan()
+        } else if centralMgr.isScanning {
+            return
+        }
         centralMgr.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        lastDiscoverAt = Date().timeIntervalSince1970
         //print("Start scanning")
+    }
+
+    func checkScanHealth() {
+        guard centralMgr.state == .poweredOn else { return }
+        let now = Date().timeIntervalSince1970
+        // If active mode stopped updating RSSI, its timer is stuck. Fall back
+        // to scanning so that discovery can reconnect to the peripheral.
+        if activeModeTimer != nil && now - lastReadAt > scanStaleTimeout {
+            print("Active mode seems stuck; falling back to scanning")
+            activeModeTimer?.invalidate()
+            activeModeTimer = nil
+            scanForPeripherals(force: true)
+            return
+        }
+        // Scanning is needed while the Device menu is open, or while no
+        // connected peripheral is being polled in active mode.
+        let scanExpected = activeModeTimer == nil || scanMode
+        if centralMgr.isScanning {
+            if !scanExpected {
+                centralMgr.stopScan()
+            } else if now - lastDiscoverAt > scanStaleTimeout {
+                print("No advertisement received for \(Int(now - lastDiscoverAt))s; restarting scan")
+                scanForPeripherals(force: true)
+            }
+        } else if scanExpected {
+            print("Scan stopped unexpectedly; restarting")
+            scanForPeripherals(force: true)
+        }
     }
 
     func startScanning() {
         scanMode = true
-        scanForPeripherals()
+        // Always begin with a clean scan. Reusing a scan that bluetoothd has
+        // silently stopped would leave the Device menu empty forever.
+        scanForPeripherals(force: true)
     }
 
     func stopScanning() {
@@ -156,6 +200,32 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         if activeModeTimer != nil {
             centralMgr.stopScan()
         }
+    }
+
+    /// Stop scanning and connections before the system goes to sleep.
+    func suspendScan() {
+        print("Suspending scan for system sleep")
+        activeModeTimer?.invalidate()
+        activeModeTimer = nil
+        connectionTimer?.invalidate()
+        connectionTimer = nil
+        if let p = monitoredPeripheral, p.state != .disconnected {
+            centralMgr.cancelPeripheralConnection(p)
+        }
+        centralMgr.stopScan()
+    }
+
+    /// A scan that spans sleep/wake is not reliable; start a fresh one.
+    func resumeScan() {
+        print("Resuming scan after system wake")
+        activeModeTimer?.invalidate()
+        activeModeTimer = nil
+        connectionTimer?.invalidate()
+        connectionTimer = nil
+        if let p = monitoredPeripheral, p.state != .disconnected {
+            centralMgr.cancelPeripheralConnection(p)
+        }
+        scanForPeripherals(force: true)
     }
 
     func setPassiveMode(_ mode: Bool) {
@@ -167,7 +237,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 centralMgr.cancelPeripheralConnection(p)
             }
         }
-        scanForPeripherals()
+        scanForPeripherals(force: true)
     }
 
     func startMonitor(uuid: UUID) {
@@ -181,7 +251,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         monitoredPeripheral = nil
         activeModeTimer?.invalidate()
         activeModeTimer = nil
-        scanForPeripherals()
+        scanForPeripherals(force: true)
     }
 
     func resetSignalTimer() {
@@ -203,15 +273,19 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         switch central.state {
         case .poweredOn:
             print("Bluetooth powered on")
-            if activeModeTimer == nil {
-                scanForPeripherals()
-            }
+            // A power cycle invalidates any previous scan. Force a restart even
+            // if the old scan still claims to be running.
+            scanForPeripherals(force: true)
             powerWarn = false
         case .poweredOff:
             print("Bluetooth powered off")
             presence = false
             signalTimer?.invalidate()
             signalTimer = nil
+            activeModeTimer?.invalidate()
+            activeModeTimer = nil
+            connectionTimer?.invalidate()
+            connectionTimer = nil
             if powerWarn {
                 powerWarn = false
                 delegate?.bluetoothPowerWarn()
@@ -305,6 +379,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                         rssi RSSI: NSNumber)
     {
         let rssi = RSSI.intValue > 0 ? 0 : RSSI.intValue
+        lastDiscoverAt = Date().timeIntervalSince1970
         if let uuid = monitoredUUID {
             if peripheral.identifier.description == uuid.description {
                 if monitoredPeripheral == nil {
@@ -387,7 +462,7 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     self.centralMgr.cancelPeripheralConnection(peripheral)
                     self.activeModeTimer?.invalidate()
                     self.activeModeTimer = nil
-                    self.scanForPeripherals()
+                    self.scanForPeripherals(force: true)
                 } else if peripheral.state == .connected {
                     peripheral.readRSSI()
                 } else {
@@ -456,5 +531,11 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     override init() {
         super.init()
         centralMgr = CBCentralManager(delegate: self, queue: nil)
+        scanWatchdogTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true, block: { [weak self] _ in
+            self?.checkScanHealth()
+        })
+        if let timer = scanWatchdogTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
     }
 }
